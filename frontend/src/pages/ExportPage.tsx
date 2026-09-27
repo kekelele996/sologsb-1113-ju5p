@@ -7,6 +7,7 @@ import MenuItem from '@mui/material/MenuItem';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import Timeline, { type TimelineBar } from '../components/common/Timeline';
 import ConflictBadge from '../components/common/ConflictBadge';
@@ -18,7 +19,7 @@ import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
-import { axisMinutes, timelineTicks } from '../utils/astro';
+import { axisMinutes, intervalsText, timelineTicks, validateSessionWindow, type SessionWindowValidation } from '../utils/astro';
 import { buildNightPlanText, buildPlanCsv, downloadText, printPage } from '../utils/export';
 
 /** 导出当晚观测清单（文本 / CSV / 打印视图） */
@@ -38,6 +39,20 @@ export default function ExportPage() {
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
+
+  /** 每段排程的 10 分钟逐段核验结果（导出列与状态核对共用） */
+  const validations = useMemo(() => {
+    const map = new Map<string, SessionWindowValidation>();
+    if (!night) return map;
+    nightSessions.forEach((session) => {
+      const target = targets.find((target) => target.id === session.targetId);
+      if (target) {
+        map.set(session.id, validateSessionWindow(target, night, session.startTime, session.endTime));
+      }
+    });
+    return map;
+  }, [nightSessions, targets, night]);
+  const failedCount = useMemo(() => nightSessions.filter((session) => validations.get(session.id)?.ok === false).length, [nightSessions, validations]);
 
   const planText = useMemo(
     () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments }),
@@ -73,7 +88,7 @@ export default function ExportPage() {
         导出当晚观测清单
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        汇总目标、时刻、滤镜与帧数为文本与 CSV，并支持打印视图；导出内容与时间轴预览保持一致。
+        汇总目标、时刻、滤镜与帧数为文本与 CSV，并支持打印视图；每段排程按 10 分钟逐段核验月光与最小高度，导出含可用起止时间与不合格原因，与时间轴预览保持一致。
       </Typography>
 
       {notice ? (
@@ -92,6 +107,7 @@ export default function ExportPage() {
         </TextField>
         <Chip size="small" label={`排程段 ${nightSessions.length}`} />
         <Chip size="small" label={`计划帧数合计 ${nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
+        <Chip size="small" color={failedCount ? 'error' : 'success'} variant={failedCount ? 'filled' : 'outlined'} label={`核验不合格 ${failedCount} 段`} />
         <ConflictBadge conflicts={conflicts} />
         <Button
           variant="contained"
@@ -139,6 +155,7 @@ export default function ExportPage() {
               .sort((a, b) => axisMinutes(a.startTime) - axisMinutes(b.startTime))
               .map((session) => {
                 const target = targets.find((item) => item.id === session.targetId);
+                const validation = validations.get(session.id);
                 return (
                   <Stack key={session.id} direction="row" spacing={1} alignItems="center" flexWrap="wrap">
                     <Chip size="small" label={`${session.startTime}-${session.endTime}`} />
@@ -146,6 +163,19 @@ export default function ExportPage() {
                     <Chip size="small" variant="outlined" label={session.filterSlot} />
                     <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧`} />
                     <StatusChip status={session.status} />
+                    {validation ? (
+                      validation.ok ? (
+                        <Chip size="small" color="success" variant="outlined" label="核验合格" />
+                      ) : (
+                        <Tooltip
+                          title={`不合格区间：${validation.badIntervals
+                            .map((interval) => `${interval.startText}-${interval.endText}（${interval.reasons.join('；')}）`)
+                            .join('，')}｜可用时段：${intervalsText(validation.usableIntervals)}`}
+                        >
+                          <Chip size="small" color="error" label={`不合格 ${validation.firstFailure?.timeText ?? ''} 起`} />
+                        </Tooltip>
+                      )
+                    ) : null}
                   </Stack>
                 );
               })}

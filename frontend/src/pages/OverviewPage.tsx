@@ -7,6 +7,7 @@ import CardContent from '@mui/material/CardContent';
 import MenuItem from '@mui/material/MenuItem';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import Chip from '@mui/material/Chip';
 import Timeline, { type TimelineBar } from '../components/common/Timeline';
@@ -19,7 +20,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
-import { altitudeAt, axisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
+import { axisMinutes, intervalsText, minutesToTime, moonBrightnessFactor, moonPhaseText, timelineTicks, validateSessionWindow, type SessionWindowValidation } from '../utils/astro';
 
 /** 本夜编排总览：30 分钟刻度时间轴 + 月相与月出月落条带 + 冲突与标灰提示 */
 export default function OverviewPage() {
@@ -38,27 +39,30 @@ export default function OverviewPage() {
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
 
-  /** 以夜间 22:00 作为高度角评估时刻 */
-  const evaluateDate = useMemo(() => new Date(`${night?.date ?? '2025-10-11'}T22:00:00`), [night?.date]);
-
   const targetById = (id: string) => targets.find((target) => target.id === id);
   const telescopeById = (id: string) => telescopes.find((item) => item.id === id);
   const instrumentById = (id: string) => instruments.find((item) => item.id === id);
 
-  const altitudes = useMemo(() => {
-    const map = new Map<string, { altitude: number; below: boolean }>();
-    targets.forEach((target) => {
-      const altitude = altitudeAt(target, evaluateDate, night?.siteLat ?? 0, night?.siteLng ?? 0);
-      map.set(target.id, { altitude, below: isBelowThreshold(altitude, target.minAltitude) });
+  /** 每段排程的 10 分钟逐段核验结果（月光 + 最小高度） */
+  const validations = useMemo(() => {
+    const map = new Map<string, SessionWindowValidation>();
+    if (!night) return map;
+    nightSessions.forEach((session) => {
+      const target = targets.find((target) => target.id === session.targetId);
+      if (target) {
+        map.set(session.id, validateSessionWindow(target, night, session.startTime, session.endTime));
+      }
     });
     return map;
-  }, [targets, evaluateDate, night?.siteLat, night?.siteLng]);
+  }, [nightSessions, targets, night]);
+
+  const failedSessions = useMemo(() => nightSessions.filter((session) => validations.get(session.id)?.ok === false), [nightSessions, validations]);
 
   const bars: TimelineBar[] = useMemo(
     () =>
       nightSessions.map((session) => {
         const target = targetById(session.targetId);
-        const altitude = altitudes.get(session.targetId);
+        const validation = validations.get(session.id);
         const startMinute = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, axisMinutes(session.startTime)));
         const rawEnd = axisMinutes(session.endTime);
         const endMinute = Math.max(startMinute + 20, Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= startMinute ? rawEnd + 1440 : rawEnd));
@@ -68,28 +72,22 @@ export default function OverviewPage() {
           endMinute,
           label: `${target?.name ?? '未知目标'} · ${telescopeById(session.telescopeId)?.code ?? '-'}`,
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
-          dimmed: session.status === '因云取消' || Boolean(altitude?.below),
+          dimmed: session.status === '因云取消' || Boolean(validation && !validation.ok),
           tooltip: `${session.startTime}-${session.endTime} ${target?.name ?? ''}｜${telescopeById(session.telescopeId)?.code ?? '-'} / ${
             instrumentById(session.instrumentId)?.model ?? '-'
-          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
+          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜${
+            validation
+              ? validation.ok
+                ? '逐段核验合格'
+                : `核验不合格：${validation.firstFailure?.timeText ?? ''} 起 ${validation.firstFailure?.reasons.join('；') ?? ''}`
+              : '缺少目标或观测夜数据'
+          }`,
         };
       }),
-    [nightSessions, targets, altitudes, telescopes, instruments],
+    [nightSessions, targets, validations, telescopes, instruments],
   );
 
   const totalFrames = nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0);
-  const dimmedTargets = useMemo(
-    () => Array.from(new Set(nightSessions.map((session) => session.targetId))).filter((id) => altitudes.get(id)?.below),
-    [nightSessions, altitudes],
-  );
-  const moonConflicts = useMemo(
-    () =>
-      Array.from(new Set(nightSessions.map((session) => session.targetId)))
-        .map((id) => targetById(id))
-        .map((target) => (target ? { target, text: moonConflict(target, night?.moonPhasePct ?? 0) } : null))
-        .filter((item): item is { target: NonNullable<ReturnType<typeof targetById>>; text: string } => Boolean(item && item.text)),
-    [nightSessions, targets, night?.moonPhasePct],
-  );
 
   if (!night) {
     return <Alert severity="info">暂无观测夜数据</Alert>;
@@ -103,7 +101,7 @@ export default function OverviewPage() {
         本夜编排总览
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰。
+        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；每段排程按 10 分钟逐段核验月光与最小地平高度，不合格区间在时间轴上标红、整段标灰。
       </Typography>
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
@@ -150,10 +148,10 @@ export default function OverviewPage() {
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
-              低于高度阈值（标灰）
+              时段核验不合格
             </Typography>
-            <Typography variant="h5" color={dimmedTargets.length ? 'warning.main' : 'success.main'}>
-              {dimmedTargets.length}
+            <Typography variant="h5" color={failedSessions.length ? 'warning.main' : 'success.main'}>
+              {failedSessions.length}
             </Typography>
           </CardContent>
         </Card>
@@ -170,27 +168,21 @@ export default function OverviewPage() {
         </Alert>
       ) : null}
 
-      {dimmedTargets.length > 0 ? (
+      {failedSessions.length > 0 ? (
         <Alert severity="warning" sx={{ mb: 2 }}>
-          <AlertTitle>目标高度角低于阈值，已在时间轴上标灰</AlertTitle>
-          {dimmedTargets.map((id) => {
-            const target = targetById(id);
-            const altitude = altitudes.get(id);
-            return target ? (
-              <div key={id}>
-                {target.name}：评估高度角 {altitude?.altitude}°，阈值 {target.minAltitude}°
+          <AlertTitle>{failedSessions.length} 个排程段未通过 10 分钟逐段核验（月光 / 最小高度），不合格区间已在时间轴上标红</AlertTitle>
+          {failedSessions.map((session) => {
+            const validation = validations.get(session.id);
+            const target = targetById(session.targetId);
+            if (!validation) return null;
+            return (
+              <div key={session.id}>
+                {session.startTime}-{session.endTime} {target?.name ?? '未知目标'}：不合格区间{' '}
+                {validation.badIntervals.map((interval) => `${interval.startText}-${interval.endText}（${interval.reasons.join('；')}）`).join('，')}
+                {validation.usableIntervals.length > 0 ? `；段内可用 ${intervalsText(validation.usableIntervals)}` : '；整段不可用'}
               </div>
-            ) : null;
+            );
           })}
-        </Alert>
-      ) : null}
-
-      {moonConflicts.length > 0 ? (
-        <Alert severity="info" sx={{ mb: 2 }}>
-          <AlertTitle>月相与目标亮度冲突提示</AlertTitle>
-          {moonConflicts.map((item) => (
-            <div key={item.target.id}>{item.text}</div>
-          ))}
         </Alert>
       ) : null}
 
@@ -238,7 +230,37 @@ export default function OverviewPage() {
             </Typography>
           </Box>
         }
-      />
+      >
+        {nightSessions.flatMap((session) => {
+          const validation = validations.get(session.id);
+          if (!validation || validation.ok) return [];
+          return validation.badIntervals.map((interval) => {
+            const start = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, interval.startAxis));
+            const end = Math.max(start, Math.min(NIGHT_TOTAL_MINUTES, interval.endAxis));
+            return (
+              <Tooltip
+                key={`${session.id}-${interval.startAxis}`}
+                title={`不合格区间 ${interval.startText}-${interval.endText}：${interval.reasons.join('；')}`}
+              >
+                <Box
+                  sx={{
+                    position: 'absolute',
+                    left: `${(start / NIGHT_TOTAL_MINUTES) * 100}%`,
+                    width: `${((end - start) / NIGHT_TOTAL_MINUTES) * 100}%`,
+                    minWidth: 6,
+                    top: 18,
+                    height: 120 - 34,
+                    bgcolor: 'rgba(211,47,47,0.45)',
+                    border: '1px dashed',
+                    borderColor: 'error.light',
+                    borderRadius: 1,
+                  }}
+                />
+              </Tooltip>
+            );
+          });
+        })}
+      </Timeline>
 
       <Box sx={{ mt: 2 }}>
         <Typography variant="subtitle1" sx={{ mb: 1 }}>
@@ -249,7 +271,7 @@ export default function OverviewPage() {
             .sort((a, b) => axisMinutes(a.startTime) - axisMinutes(b.startTime))
             .map((session) => {
               const target = targetById(session.targetId);
-              const altitude = altitudes.get(session.targetId);
+              const validation = validations.get(session.id);
               return (
                 <Card key={session.id} variant="outlined">
                   <CardContent sx={{ py: 1.25, '&:last-child': { pb: 1.25 } }}>
@@ -261,7 +283,20 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
-                      {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
+                      {validation ? (
+                        validation.ok ? (
+                          <Chip size="small" color="success" variant="outlined" label="逐段核验合格" />
+                        ) : (
+                          <Tooltip title={validation.badIntervals.map((interval) => `${interval.startText}-${interval.endText}：${interval.reasons.join('；')}`).join('｜')}>
+                            <Chip size="small" color="error" label={`核验不合格 ${validation.firstFailure?.timeText ?? ''} 起`} />
+                          </Tooltip>
+                        )
+                      ) : null}
+                      {validation && !validation.ok
+                        ? validation.badIntervals.map((interval) => (
+                            <Chip key={`${session.id}-${interval.startAxis}`} size="small" color="error" variant="outlined" label={`不合格区间 ${interval.startText}-${interval.endText}`} />
+                          ))
+                        : null}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}
                     </Stack>
                   </CardContent>

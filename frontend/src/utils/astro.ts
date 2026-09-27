@@ -134,6 +134,130 @@ export function moonConflict(target: Pick<ObsTarget, 'magnitude' | 'name'>, moon
   return undefined;
 }
 
+/** 月光影响暗目标的视星等门槛：月相 ≥85% 时 6 等以上受影响，≥60% 时 8 等以上受影响，否则不受月光限制 */
+export function moonlightMagnitudeLimit(moonPhasePct: number): number | null {
+  if (moonPhasePct >= 85) return 6;
+  if (moonPhasePct >= 60) return 8;
+  return null;
+}
+
+/** 某时刻（时间轴刻度）月亮是否在地平以上（落在月出到月落之间，跨零点安全） */
+export function isMoonUp(night: Pick<ObsNight, 'moonrise' | 'moonset'>, axis: number): boolean {
+  const rise = axisMinutes(night.moonrise);
+  let set = axisMinutes(night.moonset);
+  if (set <= rise) set += 1440;
+  return (axis >= rise && axis <= set) || (axis + 1440 >= rise && axis + 1440 <= set);
+}
+
+/** 分段核验失败类型 */
+export type ViolationKind = 'moonlight' | 'altitude';
+
+/** 单个 10 分钟分段的失败信息 */
+export interface SegmentViolation {
+  kind: ViolationKind;
+  /** 失败时刻 HH:mm（分段起点） */
+  timeText: string;
+  /** 失败原因 */
+  reason: string;
+}
+
+/** 连续区间（不合格区间或可用区间） */
+export interface WindowInterval {
+  /** 起始刻度（18:00 起算分钟，可超过 720 表示次日 06:00 后） */
+  startAxis: number;
+  endAxis: number;
+  startText: string;
+  endText: string;
+  /** 区间内出现的失败类型（仅不合格区间有，与 reasons 一一对应） */
+  kinds: ViolationKind[];
+  /** 区间内按类型去重后的原因（每类保留首次出现，仅不合格区间有） */
+  reasons: string[];
+}
+
+/** 排程段逐段核验结果 */
+export interface SessionWindowValidation {
+  /** 全部分段合格 */
+  ok: boolean;
+  /** 首个失败分段（保存前提示并拦截） */
+  firstFailure?: { timeText: string; reasons: string[] };
+  /** 合并后的不合格区间 */
+  badIntervals: WindowInterval[];
+  /** 排程段内全部采样合格的连续可用区间 */
+  usableIntervals: WindowInterval[];
+}
+
+/**
+ * 按 10 分钟逐段核验排程时段：
+ * 时段落在月出到月落之间且月相 ≥85% 时 6 等以上目标算受月光影响，≥60% 时 8 等以上受影响；
+ * 任一次采样高度角低于目标最小高度也算不合格。
+ */
+export function validateSessionWindow(target: ObsTarget, night: ObsNight, startTime: string, endTime: string, stepMinutes = 10): SessionWindowValidation {
+  const base = new Date(`${night.date}T18:00:00`);
+  const start = axisMinutes(startTime);
+  let end = axisMinutes(endTime);
+  if (end <= start) end += 1440;
+  const magnitudeLimit = moonlightMagnitudeLimit(night.moonPhasePct);
+
+  const segments: Array<{ axis: number; endAxis: number; violations: SegmentViolation[] }> = [];
+  for (let axis = start; axis < end; axis += stepMinutes) {
+    const date = new Date(base.getTime() + axis * 60_000);
+    const altitude = altitudeAt(target, date, night.siteLat, night.siteLng);
+    const timeText = minutesToTime(axis);
+    const violations: SegmentViolation[] = [];
+    if (isBelowThreshold(altitude, target.minAltitude)) {
+      violations.push({ kind: 'altitude', timeText, reason: `高度角 ${altitude}° 低于最小高度 ${target.minAltitude}°` });
+    }
+    if (magnitudeLimit !== null && target.magnitude >= magnitudeLimit && isMoonUp(night, axis)) {
+      violations.push({
+        kind: 'moonlight',
+        timeText,
+        reason: `月相 ${night.moonPhasePct}%（≥${magnitudeLimit === 6 ? 85 : 60}%）且月亮在地平以上，${magnitudeLimit} 等以上目标受月光影响（${target.name} ${target.magnitude} 等）`,
+      });
+    }
+    segments.push({ axis, endAxis: Math.min(axis + stepMinutes, end), violations });
+  }
+
+  const badIntervals: WindowInterval[] = [];
+  const usableIntervals: WindowInterval[] = [];
+  segments.forEach((segment) => {
+    const bucket = segment.violations.length > 0 ? badIntervals : usableIntervals;
+    const last = bucket[bucket.length - 1];
+    if (last && last.endAxis === segment.axis) {
+      last.endAxis = segment.endAxis;
+      last.endText = minutesToTime(segment.endAxis);
+      segment.violations.forEach((violation) => {
+        if (!last.kinds.includes(violation.kind)) {
+          last.kinds.push(violation.kind);
+          last.reasons.push(violation.reason);
+        }
+      });
+    } else {
+      bucket.push({
+        startAxis: segment.axis,
+        endAxis: segment.endAxis,
+        startText: minutesToTime(segment.axis),
+        endText: minutesToTime(segment.endAxis),
+        kinds: segment.violations.map((violation) => violation.kind),
+        reasons: segment.violations.map((violation) => violation.reason),
+      });
+    }
+  });
+
+  const firstBad = segments.find((segment) => segment.violations.length > 0);
+  return {
+    ok: !firstBad,
+    firstFailure: firstBad ? { timeText: minutesToTime(firstBad.axis), reasons: firstBad.violations.map((violation) => violation.reason) } : undefined,
+    badIntervals,
+    usableIntervals,
+  };
+}
+
+/** 区间列表 → '20:00-21:00；21:30-23:00'，空列表返回占位文案 */
+export function intervalsText(intervals: WindowInterval[], emptyText = '无可用时段'): string {
+  if (intervals.length === 0) return emptyText;
+  return intervals.map((interval) => `${interval.startText}-${interval.endText}`).join('；');
+}
+
 /** 夜间时间轴刻度（每 2 小时） */
 export function timelineTicks(stepMinutes = 120): number[] {
   const ticks: number[] = [];

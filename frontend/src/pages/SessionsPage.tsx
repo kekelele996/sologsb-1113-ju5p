@@ -19,6 +19,7 @@ import TableContainer from '@mui/material/TableContainer';
 import TableHead from '@mui/material/TableHead';
 import TableRow from '@mui/material/TableRow';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
@@ -30,7 +31,7 @@ import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
-import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { axisMinutes, durationMinutes, formatMinutes, intervalsText, validateSessionWindow } from '../utils/astro';
 
 interface SessionFormState {
   nightId: string;
@@ -117,6 +118,28 @@ export default function SessionsPage() {
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
 
+  /** 对话框内实时逐段核验（10 分钟采样：月光与最小高度） */
+  const liveValidation = useMemo(() => {
+    if (!dialogOpen) return null;
+    const night = nights.find((night) => night.id === form.nightId);
+    const target = targets.find((target) => target.id === form.targetId);
+    if (!night || !target || durationMinutes(form.startTime, form.endTime) <= 0) return null;
+    return validateSessionWindow(target, night, form.startTime, form.endTime);
+  }, [dialogOpen, nights, targets, form.nightId, form.targetId, form.startTime, form.endTime]);
+
+  /** 列表每行的逐段核验结果（按排程段 id 缓存） */
+  const validations = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof validateSessionWindow>>();
+    sessions.forEach((session) => {
+      const night = nights.find((night) => night.id === session.nightId);
+      const target = targets.find((target) => target.id === session.targetId);
+      if (night && target) {
+        map.set(session.id, validateSessionWindow(target, night, session.startTime, session.endTime));
+      }
+    });
+    return map;
+  }, [sessions, nights, targets]);
+
   function openCreate() {
     setEditingId('');
     setError('');
@@ -171,6 +194,10 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
+    if (liveValidation && !liveValidation.ok && liveValidation.firstFailure) {
+      setError(`时段核验未通过：首个不合格时刻 ${liveValidation.firstFailure.timeText}，${liveValidation.firstFailure.reasons.join('；')}。请调整时段或改期到备用观测夜`);
+      return;
+    }
     if (editingId) {
       await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
       setNotice('已更新排程段');
@@ -199,7 +226,7 @@ export default function SessionsPage() {
         排程段列表与冲突检测
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
+        同一时段同一望远镜重复排入即进入冲突列表；保存前按 10 分钟逐段核验月光与最小地平高度，不合格时段会被拦截并指出首个失败时刻；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
       </Typography>
 
       {notice ? (
@@ -260,6 +287,7 @@ export default function SessionsPage() {
               <TableCell align="right">帧数</TableCell>
               <TableCell>状态</TableCell>
               <TableCell>冲突</TableCell>
+              <TableCell>时段核验</TableCell>
               <TableCell>改期原因</TableCell>
               <TableCell align="right">操作</TableCell>
             </TableRow>
@@ -309,6 +337,30 @@ export default function SessionsPage() {
                     <ConflictBadge conflicts={conflicts} compact />
                   </TableCell>
                   <TableCell>
+                    {(() => {
+                      const validation = validations.get(session.id);
+                      if (!validation) {
+                        return (
+                          <Typography variant="caption" color="text.secondary">
+                            -
+                          </Typography>
+                        );
+                      }
+                      if (validation.ok) {
+                        return <Chip size="small" color="success" variant="outlined" label="核验合格" />;
+                      }
+                      return (
+                        <Tooltip
+                          title={`不合格区间：${validation.badIntervals
+                            .map((interval) => `${interval.startText}-${interval.endText}（${interval.reasons.join('；')}）`)
+                            .join('，')}｜可用时段：${intervalsText(validation.usableIntervals)}`}
+                        >
+                          <Chip size="small" color="error" label={`不合格 ${validation.firstFailure?.timeText ?? ''} 起`} />
+                        </Tooltip>
+                      );
+                    })()}
+                  </TableCell>
+                  <TableCell>
                     {session.rescheduleReason ? (
                       <Typography variant="caption">{session.rescheduleReason}</Typography>
                     ) : (
@@ -343,16 +395,26 @@ export default function SessionsPage() {
               {error}
             </Alert>
           ) : null}
+          {liveValidation && !liveValidation.ok && liveValidation.firstFailure ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              时段核验未通过（按 10 分钟逐段采样）：首个不合格时刻 <strong>{liveValidation.firstFailure.timeText}</strong>，
+              {liveValidation.firstFailure.reasons.join('；')}。
+              {liveValidation.usableIntervals.length > 0
+                ? ` 段内可用时段：${intervalsText(liveValidation.usableIntervals)}`
+                : ' 整段均不合格，请调整时段或改期到备用观测夜。'}
+            </Alert>
+          ) : null}
           {liveConflicts.length > 0 ? (
             <Alert severity="warning" sx={{ mb: 1.5 }}>
               该望远镜在所选时段已有 {liveConflicts.length} 段排程：
               {liveConflicts.map((conflict) => ` ${conflict.otherId}（${conflict.overlapText}）`).join('；')}
             </Alert>
-          ) : (
+          ) : null}
+          {liveConflicts.length === 0 && liveValidation?.ok ? (
             <Alert severity="success" sx={{ mb: 1.5 }}>
-              时段校验通过，该望远镜此时段空闲
+              时段校验通过：望远镜此时段空闲，且 10 分钟逐段核验（月光 / 最小高度）全部合格
             </Alert>
-          )}
+          ) : null}
           <FieldRow label="观测夜" required>
             <TextField select size="small" fullWidth value={form.nightId} onChange={(event) => setForm({ ...form, nightId: event.target.value })}>
               {nights.map((night) => (

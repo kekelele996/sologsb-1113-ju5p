@@ -1,4 +1,5 @@
 import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import { intervalsText, validateSessionWindow, type SessionWindowValidation } from './astro';
 
 export interface PlanContext {
   night?: ObsNight;
@@ -12,7 +13,21 @@ function pad(value: number, width = 2): string {
   return String(value).padStart(width, '0');
 }
 
-/** 生成当晚观测清单文本（目标、时刻、滤镜、帧数） */
+/** 单段排程的 10 分钟逐段核验（缺少观测夜或目标时返回 undefined） */
+function validateSession(session: ObsSession, context: PlanContext): SessionWindowValidation | undefined {
+  const { night, targets } = context;
+  const target = targets.find((item) => item.id === session.targetId);
+  if (!night || !target) return undefined;
+  return validateSessionWindow(target, night, session.startTime, session.endTime);
+}
+
+/** 核验不合格原因汇总（合格返回空串） */
+function violationText(validation: SessionWindowValidation | undefined): string {
+  if (!validation || validation.ok) return '';
+  return validation.badIntervals.map((interval) => `${interval.startText}-${interval.endText} ${interval.reasons.join('；')}`).join('｜');
+}
+
+/** 生成当晚观测清单文本（目标、时刻、滤镜、帧数、可用起止时间与核验原因） */
 export function buildNightPlanText(context: PlanContext): string {
   const { night, sessions, targets, telescopes, instruments } = context;
   const lines: string[] = [];
@@ -23,13 +38,19 @@ export function buildNightPlanText(context: PlanContext): string {
       night ? `${night.sunset} / ${night.sunrise}` : '-'
     }　云量预报：${night?.cloudText ?? '-'}`,
   );
+  lines.push('时段核验：按 10 分钟逐段采样；月相 ≥85% 时 6 等以上、≥60% 时 8 等以上目标落在月出月落之间算受月光影响；任一采样低于最小高度即不合格');
   lines.push('-'.repeat(96));
-  lines.push('序 时段           目标            望远镜   终端            滤镜  帧数  状态      备注');
+  lines.push('序 时段           目标                     望远镜   终端             滤镜   帧数  状态      可用起止时间              核验原因 / 备注');
   const ordered = [...sessions].sort((a, b) => a.startTime.localeCompare(b.startTime));
+  let failedCount = 0;
   ordered.forEach((session, index) => {
     const target = targets.find((item) => item.id === session.targetId);
     const telescope = telescopes.find((item) => item.id === session.telescopeId);
     const instrument = instruments.find((item) => item.id === session.instrumentId);
+    const validation = validateSession(session, context);
+    if (validation && !validation.ok) failedCount += 1;
+    const usableText = validation ? intervalsText(validation.usableIntervals) : '-';
+    const noteText = [violationText(validation), session.rescheduleReason].filter(Boolean).join('；');
     lines.push(
       [
         pad(index + 1),
@@ -40,7 +61,8 @@ export function buildNightPlanText(context: PlanContext): string {
         session.filterSlot.padEnd(6, ' '),
         pad(session.plannedFrames, 4),
         session.status.padEnd(8, ' '),
-        session.rescheduleReason ?? '',
+        usableText.padEnd(24, ' '),
+        noteText,
       ].join(' '),
     );
   });
@@ -50,21 +72,22 @@ export function buildNightPlanText(context: PlanContext): string {
     const target = targets.find((item) => item.id === session.targetId);
     return sum + (target ? (session.plannedFrames * target.exposureSec) / 60 : 0);
   }, 0);
-  lines.push(`合计排程段 ${ordered.length} 段，计划帧数 ${totalFrames} 帧，预计曝光 ${totalExposure.toFixed(1)} 分钟`);
+  lines.push(`合计排程段 ${ordered.length} 段，计划帧数 ${totalFrames} 帧，预计曝光 ${totalExposure.toFixed(1)} 分钟；核验不合格 ${failedCount} 段`);
   lines.push(`导出时间：${new Date().toLocaleString('zh-CN')}`);
   return lines.join('\n');
 }
 
-/** 生成 CSV */
+/** 生成 CSV（含可用起止时间与不合格原因列） */
 export function buildPlanCsv(context: PlanContext): string {
   const { sessions, targets, telescopes, instruments } = context;
-  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '改期原因'];
+  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '可用开始', '可用结束', '不合格原因', '改期原因'];
   const rows = [...sessions]
     .sort((a, b) => a.startTime.localeCompare(b.startTime))
     .map((session) => {
       const target = targets.find((item) => item.id === session.targetId);
       const telescope = telescopes.find((item) => item.id === session.telescopeId);
       const instrument = instruments.find((item) => item.id === session.instrumentId);
+      const validation = validateSession(session, context);
       return [
         session.nightId,
         `${session.startTime}-${session.endTime}`,
@@ -78,6 +101,9 @@ export function buildPlanCsv(context: PlanContext): string {
         String(session.plannedFrames),
         target ? String(target.exposureSec) : '',
         session.status,
+        validation ? validation.usableIntervals.map((interval) => interval.startText).join(';') || '无' : '',
+        validation ? validation.usableIntervals.map((interval) => interval.endText).join(';') || '无' : '',
+        violationText(validation),
         session.rescheduleReason ?? '',
       ];
     });
