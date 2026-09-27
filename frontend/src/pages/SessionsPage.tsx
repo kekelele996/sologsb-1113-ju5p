@@ -30,7 +30,7 @@ import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
-import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { axisMinutes, durationMinutes, formatMinutes, validateSessionWindow } from '../utils/astro';
 
 interface SessionFormState {
   nightId: string;
@@ -117,6 +117,15 @@ export default function SessionsPage() {
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
 
+  /** 逐段核验当前表单时段：月光干扰与最小高度（10 分钟采样） */
+  const liveWindow = useMemo(() => {
+    if (!dialogOpen) return null;
+    const night = nights.find((item) => item.id === form.nightId);
+    const target = targets.find((item) => item.id === form.targetId);
+    if (!night || !target) return null;
+    return validateSessionWindow(target, night, form.startTime, form.endTime);
+  }, [dialogOpen, nights, targets, form.nightId, form.targetId, form.startTime, form.endTime]);
+
   function openCreate() {
     setEditingId('');
     setError('');
@@ -171,6 +180,10 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
+    if (liveWindow && !liveWindow.ok && liveWindow.firstFailure) {
+      setError(`时段核验未通过：首个失败时刻 ${liveWindow.firstFailure.timeText}，${liveWindow.firstFailure.reason}。请调整时段或改期到备用观测夜`);
+      return;
+    }
     if (editingId) {
       await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
       setNotice('已更新排程段');
@@ -199,7 +212,7 @@ export default function SessionsPage() {
         排程段列表与冲突检测
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
+        同一时段同一望远镜重复排入即进入冲突列表；保存前按 10 分钟逐段核验月光干扰与最小高度，不合格即拦截；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
       </Typography>
 
       {notice ? (
@@ -348,11 +361,18 @@ export default function SessionsPage() {
               该望远镜在所选时段已有 {liveConflicts.length} 段排程：
               {liveConflicts.map((conflict) => ` ${conflict.otherId}（${conflict.overlapText}）`).join('；')}
             </Alert>
-          ) : (
-            <Alert severity="success" sx={{ mb: 1.5 }}>
-              时段校验通过，该望远镜此时段空闲
+          ) : null}
+          {liveWindow && !liveWindow.ok && liveWindow.firstFailure ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              时段核验未通过（10 分钟逐段采样，共 {liveWindow.failures.length} 处不合格）：首个失败时刻 {liveWindow.firstFailure.timeText}，
+              {liveWindow.firstFailure.reason}，保存将被拦截
             </Alert>
-          )}
+          ) : null}
+          {liveConflicts.length === 0 && (!liveWindow || liveWindow.ok) ? (
+            <Alert severity="success" sx={{ mb: 1.5 }}>
+              时段校验通过，该望远镜此时段空闲，高度与月光核验合格
+            </Alert>
+          ) : null}
           <FieldRow label="观测夜" required>
             <TextField select size="small" fullWidth value={form.nightId} onChange={(event) => setForm({ ...form, nightId: event.target.value })}>
               {nights.map((night) => (

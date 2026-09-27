@@ -1,4 +1,5 @@
 import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import { usableWindows, usableWindowsText, validateSessionWindow } from './astro';
 
 export interface PlanContext {
   night?: ObsNight;
@@ -10,6 +11,17 @@ export interface PlanContext {
 
 function pad(value: number, width = 2): string {
   return String(value).padStart(width, '0');
+}
+
+/** 单条排程段的可用起止与时段核验结论（导出用） */
+function sessionCheckText(session: ObsSession, context: PlanContext): { usableText: string; checkText: string } {
+  const { night, targets } = context;
+  const target = targets.find((item) => item.id === session.targetId);
+  if (!target || !night) return { usableText: '-', checkText: '-' };
+  const usableText = usableWindowsText(usableWindows(target, night));
+  const result = validateSessionWindow(target, night, session.startTime, session.endTime);
+  const checkText = result.ok ? '合格' : `不合格：首个失败时刻 ${result.firstFailure?.timeText ?? '-'}，${result.firstFailure?.reason ?? ''}`;
+  return { usableText, checkText };
 }
 
 /** 生成当晚观测清单文本（目标、时刻、滤镜、帧数） */
@@ -24,12 +36,13 @@ export function buildNightPlanText(context: PlanContext): string {
     }　云量预报：${night?.cloudText ?? '-'}`,
   );
   lines.push('-'.repeat(96));
-  lines.push('序 时段           目标            望远镜   终端            滤镜  帧数  状态      备注');
+  lines.push('序 时段           目标            望远镜   终端            滤镜  帧数  状态      可用时段                   时段核验与备注');
   const ordered = [...sessions].sort((a, b) => a.startTime.localeCompare(b.startTime));
   ordered.forEach((session, index) => {
     const target = targets.find((item) => item.id === session.targetId);
     const telescope = telescopes.find((item) => item.id === session.telescopeId);
     const instrument = instruments.find((item) => item.id === session.instrumentId);
+    const { usableText, checkText } = sessionCheckText(session, context);
     lines.push(
       [
         pad(index + 1),
@@ -40,7 +53,8 @@ export function buildNightPlanText(context: PlanContext): string {
         session.filterSlot.padEnd(6, ' '),
         pad(session.plannedFrames, 4),
         session.status.padEnd(8, ' '),
-        session.rescheduleReason ?? '',
+        usableText.padEnd(26, ' '),
+        [checkText, session.rescheduleReason].filter(Boolean).join('；'),
       ].join(' '),
     );
   });
@@ -50,7 +64,8 @@ export function buildNightPlanText(context: PlanContext): string {
     const target = targets.find((item) => item.id === session.targetId);
     return sum + (target ? (session.plannedFrames * target.exposureSec) / 60 : 0);
   }, 0);
-  lines.push(`合计排程段 ${ordered.length} 段，计划帧数 ${totalFrames} 帧，预计曝光 ${totalExposure.toFixed(1)} 分钟`);
+  const failedCount = ordered.filter((session) => sessionCheckText(session, context).checkText.startsWith('不合格')).length;
+  lines.push(`合计排程段 ${ordered.length} 段，计划帧数 ${totalFrames} 帧，预计曝光 ${totalExposure.toFixed(1)} 分钟，时段核验不合格 ${failedCount} 段`);
   lines.push(`导出时间：${new Date().toLocaleString('zh-CN')}`);
   return lines.join('\n');
 }
@@ -58,13 +73,14 @@ export function buildNightPlanText(context: PlanContext): string {
 /** 生成 CSV */
 export function buildPlanCsv(context: PlanContext): string {
   const { sessions, targets, telescopes, instruments } = context;
-  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '改期原因'];
+  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '可用起止', '时段核验', '改期原因'];
   const rows = [...sessions]
     .sort((a, b) => a.startTime.localeCompare(b.startTime))
     .map((session) => {
       const target = targets.find((item) => item.id === session.targetId);
       const telescope = telescopes.find((item) => item.id === session.telescopeId);
       const instrument = instruments.find((item) => item.id === session.instrumentId);
+      const { usableText, checkText } = sessionCheckText(session, context);
       return [
         session.nightId,
         `${session.startTime}-${session.endTime}`,
@@ -78,6 +94,8 @@ export function buildPlanCsv(context: PlanContext): string {
         String(session.plannedFrames),
         target ? String(target.exposureSec) : '',
         session.status,
+        usableText,
+        checkText,
         session.rescheduleReason ?? '',
       ];
     });

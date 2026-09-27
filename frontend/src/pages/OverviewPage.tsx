@@ -19,7 +19,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
-import { altitudeAt, axisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
+import { altitudeAt, axisMinutes, failureIntervals, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks, validateSessionWindow, type SessionWindowResult } from '../utils/astro';
 
 /** 本夜编排总览：30 分钟刻度时间轴 + 月相与月出月落条带 + 冲突与标灰提示 */
 export default function OverviewPage() {
@@ -91,11 +91,31 @@ export default function OverviewPage() {
     [nightSessions, targets, night?.moonPhasePct],
   );
 
+  /** 逐段核验每个排程段（10 分钟采样）：月光干扰与最小高度 */
+  const windowResults = useMemo(() => {
+    const map = new Map<string, SessionWindowResult>();
+    if (!night) return map;
+    nightSessions.forEach((session) => {
+      const target = targets.find((item) => item.id === session.targetId);
+      if (target) map.set(session.id, validateSessionWindow(target, night, session.startTime, session.endTime));
+    });
+    return map;
+  }, [nightSessions, targets, night]);
+
+  const windowIssues = useMemo(
+    () =>
+      nightSessions
+        .map((session) => ({ session, result: windowResults.get(session.id) }))
+        .filter((item): item is { session: (typeof nightSessions)[number]; result: SessionWindowResult } => Boolean(item.result && !item.result.ok)),
+    [nightSessions, windowResults],
+  );
+
   if (!night) {
     return <Alert severity="info">暂无观测夜数据</Alert>;
   }
 
   const ticks = timelineTicks(120);
+  const timelineHeight = 120;
 
   return (
     <Box>
@@ -103,7 +123,7 @@ export default function OverviewPage() {
         本夜编排总览
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰。
+        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰；按 10 分钟逐段核验月光干扰与最小高度，不合格区间在时间轴上以红色标出。
       </Typography>
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
@@ -120,7 +140,7 @@ export default function OverviewPage() {
         <ConflictBadge conflicts={conflicts} />
       </Stack>
 
-      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' }, gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2, mb: 2 }}>
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
@@ -157,7 +177,29 @@ export default function OverviewPage() {
             </Typography>
           </CardContent>
         </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              时段核验不合格
+            </Typography>
+            <Typography variant="h5" color={windowIssues.length ? 'error.main' : 'success.main'}>
+              {windowIssues.length}
+            </Typography>
+          </CardContent>
+        </Card>
       </Box>
+
+      {windowIssues.length > 0 ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          <AlertTitle>{windowIssues.length} 个排程段时段核验不合格（时间轴上以红色区间标出）</AlertTitle>
+          {windowIssues.map(({ session, result }) => (
+            <div key={session.id}>
+              {session.startTime}-{session.endTime} {targetById(session.targetId)?.name ?? '未知目标'}：首个失败时刻 {result.firstFailure?.timeText}，
+              {result.firstFailure?.reason}
+            </div>
+          ))}
+        </Alert>
+      ) : null}
 
       {conflicts.length > 0 ? (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -199,7 +241,7 @@ export default function OverviewPage() {
         ticks={ticks}
         totalMinutes={NIGHT_TOTAL_MINUTES}
         conflictIds={ids}
-        height={120}
+        height={timelineHeight}
         strip={
           <Box sx={{ position: 'relative', height: 42, bgcolor: 'grey.900', borderRadius: 1, overflow: 'hidden' }}>
             <Box
@@ -238,7 +280,34 @@ export default function OverviewPage() {
             </Typography>
           </Box>
         }
-      />
+      >
+        {/* 不合格区间标红（10 分钟逐段核验：月光干扰 / 低于最小高度） */}
+        {windowIssues.flatMap(({ session, result }) =>
+          failureIntervals(result.failures).map((interval, index) => {
+            const left = Math.max(0, interval.startAxis);
+            const right = Math.min(NIGHT_TOTAL_MINUTES, interval.endAxis);
+            if (right <= left) return null;
+            return (
+              <Box
+                key={`${session.id}-fail-${index}`}
+                sx={{
+                  position: 'absolute',
+                  top: 18,
+                  height: timelineHeight - 34,
+                  left: `${(left / NIGHT_TOTAL_MINUTES) * 100}%`,
+                  width: `${((right - left) / NIGHT_TOTAL_MINUTES) * 100}%`,
+                  bgcolor: 'rgba(211, 47, 47, 0.35)',
+                  border: '1px dashed',
+                  borderColor: 'error.main',
+                  borderRadius: 1,
+                  pointerEvents: 'none',
+                  zIndex: 2,
+                }}
+              />
+            );
+          }),
+        )}
+      </Timeline>
 
       <Box sx={{ mt: 2 }}>
         <Typography variant="subtitle1" sx={{ mb: 1 }}>
@@ -250,6 +319,7 @@ export default function OverviewPage() {
             .map((session) => {
               const target = targetById(session.targetId);
               const altitude = altitudes.get(session.targetId);
+              const windowIssue = windowResults.get(session.id);
               return (
                 <Card key={session.id} variant="outlined">
                   <CardContent sx={{ py: 1.25, '&:last-child': { pb: 1.25 } }}>
@@ -261,6 +331,9 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
+                      {windowIssue && !windowIssue.ok ? (
+                        <Chip size="small" color="error" variant="outlined" label={`时段不合格 ${windowIssue.firstFailure?.timeText ?? ''} 起：${windowIssue.firstFailure?.reason ?? ''}`} />
+                      ) : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}
                     </Stack>
